@@ -2,3 +2,4 @@ Rank,Submission_ID,Participant_ID,Submission_Num,RMSE,Filename,Pfad
 1,PARTICIPANT_998_Sub1,998,1,0.000000,Results_998_1.csv,C:\Users\kevin.haizmann\OneDrive - OST\Dokumente\Switch\Exports\static_yaw_misalignment\PARTICIPANT_998
 2,PARTICIPANT_999_Sub1,999,1,0.239792,Results_999_1.csv,C:\Users\kevin.haizmann\OneDrive - OST\Dokumente\Switch\Exports\static_yaw_misalignment\PARTICIPANT_999
 3,PARTICIPANT_999_Sub2,999,2,0.642262,Results_999_2.csv,C:\Users\kevin.haizmann\OneDrive - OST\Dokumente\Switch\Exports\static_yaw_misalignment\PARTICIPANT_999
+4,PARTICIPANT_997_Sub1,997,1,2.350000,Results_997_1.csv,C:\Users\kevin.haizmann\OneDrive - OST\Dokumente\Switch\Exports\static_yaw_misalignment\PARTICIPANT_997

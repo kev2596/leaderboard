@@ -2,377 +2,311 @@ import subprocess
 import json
 import re
 import os
-import numpy as np
+import shutil
 import csv
 import time
 from datetime import datetime
+from pathlib import Path
+from typing import Dict, List, Tuple, Optional
+import numpy as np
 
-# ---- Einstellungen ----
-RCLONE = r"C:\Users\kevin.haizmann\Downloads\rclone-v1.71.2-windows-amd64\rclone-v1.71.2-windows-amd64\rclone.exe"
-REMOTE = "switch:"
-LOCAL_ROOT = r"C:\Users\kevin.haizmann\OneDrive - OST\Dokumente\Switch\Exports"
-SOLUTION_DIR = os.path.join(LOCAL_ROOT, "solution")
-GIT = r"C:\Program Files\Git\bin\git.exe"
+# ==================== KONFIGURATION ====================
+class Config:
+    RCLONE = Path(r"C:\Users\kevin.haizmann\Downloads\rclone-v1.71.2-windows-amd64\rclone-v1.71.2-windows-amd64\rclone.exe")
+    GIT = Path(r"C:\Program Files\Git\bin\git.exe")
+    REMOTE = "switch:"
+    LOCAL_ROOT = Path(r"C:\Users\kevin.haizmann\OneDrive - OST\Dokumente\Switch\Exports")
+    SOLUTION_DIR = LOCAL_ROOT / "solution"
+    GITHUB_REPO = Path(r"C:\Users\kevin.haizmann\OneDrive - OST\Dokumente\leaderboard")
+    ENABLE_GIT_PUSH = True
+    UPDATE_INTERVAL_HOURS = 1
+    PARTICIPANT_PATTERN = re.compile(r"PARTICIPANT_\d{1,3}")
+    SUBMISSION_PATTERN = re.compile(r"Results_(\d+)_(\d+)\.csv", re.IGNORECASE)
 
-# GitHub Settings
-GITHUB_REPO_PATH = r"C:\Users\kevin.haizmann\OneDrive - OST\Dokumente\leaderboard"
-ENABLE_GIT_PUSH = True
-
-# ---- Regex für Participant-Ordner ----
-PART_REGEX = re.compile(r"PARTICIPANT_\d{1,3}")
-
-# ---- Logging ----
-def log(message):
+# ==================== LOGGING ====================
+def log(message: str, level: str = "INFO"):
+    """Unified logging with emoji prefixes."""
+    emoji_map = {
+        "INFO": "ℹ️", "SUCCESS": "✅", "WARNING": "⚠️", 
+        "ERROR": "❌", "PROCESS": "🔄", "DATA": "📊"
+    }
     timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-    print(f"[{timestamp}] {message}")
+    print(f"[{timestamp}] {emoji_map.get(level, '•')} {message}")
 
-# ---- Hilfsfunktion zum Ausführen von rclone ----
-def run_rclone(cmd):
+# ==================== RCLONE OPERATIONS ====================
+def run_command(cmd: List[str], check: bool = False) -> Tuple[int, str, str]:
+    """Execute shell command and return output."""
     result = subprocess.run(cmd, capture_output=True, text=True)
+    if check and result.returncode != 0:
+        raise subprocess.CalledProcessError(result.returncode, cmd, result.stderr)
     return result.returncode, result.stdout, result.stderr
 
-# ---- Alle Verzeichnisse auf dem Remote abrufen ----
-def get_all_remote_dirs():
-    cmd = [RCLONE, "lsjson", REMOTE, "-R", "--dirs-only"]
-    rc, out, err = run_rclone(cmd)
-    if rc != 0:
-        log(f"❌ Fehler beim Abrufen der Verzeichnisse: {err}")
-        return []
+def get_remote_directories() -> List[str]:
+    """Fetch all directories from remote."""
     try:
-        items = json.loads(out)
-        return [item["Path"].replace("\\", "/") for item in items if "Path" in item]
+        rc, out, err = run_command([str(Config.RCLONE), "lsjson", Config.REMOTE, "-R", "--dirs-only"])
+        if rc != 0:
+            log(f"Failed to fetch directories: {err}", "ERROR")
+            return []
+        return [item["Path"].replace("\\", "/") for item in json.loads(out) if "Path" in item]
     except Exception as e:
-        log(f"❌ Fehler beim Parsen von rclone-Ausgabe: {e}")
+        log(f"Error parsing rclone output: {e}", "ERROR")
         return []
 
-# ---- Participant-Ordner finden ----
-def find_participant_bases(dir_paths):
-    participant_paths = set()
-    for p in dir_paths:
-        parts = p.split("/")
-        for i, seg in enumerate(parts):
-            if PART_REGEX.fullmatch(seg):
-                base = "/".join(parts[:i + 1])
-                participant_paths.add(base)
+def find_participant_directories(all_dirs: List[str]) -> List[str]:
+    """Extract participant base directories."""
+    participants = set()
+    for path in all_dirs:
+        parts = path.split("/")
+        for i, segment in enumerate(parts):
+            if Config.PARTICIPANT_PATTERN.fullmatch(segment):
+                participants.add("/".join(parts[:i + 1]))
                 break
-    return sorted(participant_paths)
+    return sorted(participants)
 
-# ---- Submissions kopieren ----
-def copy_submissions(participant_path):
-    remote_sub = f"{REMOTE}{participant_path}/Submissions"
-    local_sub = os.path.join(LOCAL_ROOT, *participant_path.split("/"), "Submissions")
-
-    log(f"📥 Kopiere: {remote_sub}")
-    cmd = [
-        RCLONE, "copy", remote_sub, local_sub,
-        "--update", "--create-empty-src-dirs"
-    ]
-    rc, out, err = run_rclone(cmd)
-
+def sync_submissions(participant_path: str) -> bool:
+    """Download submissions for a participant."""
+    remote_path = f"{Config.REMOTE}{participant_path}/Submissions"
+    local_path = Config.LOCAL_ROOT / participant_path.replace("/", os.sep) / "Submissions"
+    
+    log(f"Syncing: {participant_path}")
+    cmd = [str(Config.RCLONE), "copy", remote_path, str(local_path), "--update", "--create-empty-src-dirs"]
+    rc, _, err = run_command(cmd)
+    
     if rc == 0:
-        log(f"✅ {participant_path}")
+        return True
+    elif "not found" in err.lower():
+        log(f"No submissions folder for {participant_path}", "WARNING")
     else:
-        if "not found" in (err + out).lower():
-            log(f"⚠️ Kein Submissions-Ordner für {participant_path}")
-        else:
-            log(f"❌ Fehler bei {participant_path}: {err.strip()}")
+        log(f"Sync failed for {participant_path}: {err}", "ERROR")
+    return False
 
-# ---- Dateien einlesen ----
-def load_numeric_file(path):
+# ==================== DATA PROCESSING ====================
+def load_csv_data(filepath: Path) -> Optional[np.ndarray]:
+    """Load numeric data from CSV, handling various formats."""
     try:
-        try:
-            arr = np.loadtxt(path, delimiter=",", skiprows=1)
-        except Exception:
+        for kwargs in [
+            {"delimiter": ",", "skiprows": 1},
+            {"skiprows": 1},
+            {"delimiter": ","},
+            {}
+        ]:
             try:
-                arr = np.loadtxt(path, skiprows=1)
-            except Exception:
-                try:
-                    arr = np.loadtxt(path, delimiter=",")
-                except Exception:
-                    arr = np.loadtxt(path)
-        
-        if arr.ndim > 1:
-            if arr.shape[1] >= 2:
-                arr = arr[:, 1]
-            else:
-                arr = arr.flatten()
-        
-        return np.asarray(arr, dtype=float)
+                arr = np.loadtxt(filepath, **kwargs)
+                if arr.ndim > 1 and arr.shape[1] >= 2:
+                    arr = arr[:, 1]  # Extract value column
+                elif arr.ndim > 1:
+                    arr = arr.flatten()
+                return arr.astype(float)
+            except:
+                continue
+        return None
     except Exception as e:
-        log(f"⚠️ Datei nicht numerisch lesbar: {path} — {e}")
+        log(f"Cannot read {filepath.name}: {e}", "WARNING")
         return None
 
-def parse_submission_filename(fname):
-    pattern = r"Results_(\d+)_(\d+)\.csv"
-    match = re.match(pattern, fname, re.IGNORECASE)
-    if match:
-        return match.group(1), int(match.group(2))
-    return None, None
-
-def match_solution_file(submission_fname, solutions):
-    if solutions:
-        return list(solutions.keys())[0]
-    return None
-
-def load_solutions(solution_dir):
+def load_solutions() -> Dict[str, np.ndarray]:
+    """Load all solution files."""
     solutions = {}
-    if not os.path.isdir(solution_dir):
-        log(f"❌ Solution-Ordner existiert nicht: {solution_dir}")
+    if not Config.SOLUTION_DIR.exists():
+        log(f"Solution directory missing: {Config.SOLUTION_DIR}", "ERROR")
         return solutions
-    for fname in os.listdir(solution_dir):
-        fpath = os.path.join(solution_dir, fname)
-        if os.path.isfile(fpath):
-            arr = load_numeric_file(fpath)
-            if arr is not None:
-                solutions[fname] = arr
-    log(f"🔢 Geladene Lösungsdateien: {len(solutions)}")
+    
+    for file in Config.SOLUTION_DIR.glob("*.csv"):
+        data = load_csv_data(file)
+        if data is not None:
+            solutions[file.name] = data
+    
+    log(f"Loaded {len(solutions)} solution file(s)", "DATA")
     return solutions
 
-def find_local_participants(local_root):
-    matches = []
-    for root, dirs, _ in os.walk(local_root):
-        for d in dirs:
-            if PART_REGEX.fullmatch(d):
-                matches.append(os.path.join(root, d))
-    matches = sorted(set(matches))
-    log(f"👥 Gefundene lokale Participant-Ordner: {len(matches)}")
-    return matches
-
-def compute_rmse(a, b):
-    if a is None or b is None:
+def compute_rmse(prediction: np.ndarray, truth: np.ndarray) -> Optional[float]:
+    """Calculate RMSE between two arrays."""
+    if prediction is None or truth is None or len(prediction) == 0 or len(truth) == 0:
         return None
-    la, lb = len(a), len(b)
-    if la == 0 or lb == 0:
-        return None
-    if la != lb:
-        L = min(la, lb)
-        a2, b2 = a[:L], b[:L]
-    else:
-        a2, b2 = a, b
-    mse = np.mean((a2 - b2) ** 2)
+    
+    length = min(len(prediction), len(truth))
+    mse = np.mean((prediction[:length] - truth[:length]) ** 2)
     return float(np.sqrt(mse))
 
-# ---- Evaluation aller Teilnehmer ----
-def evaluate_participants(solutions, local_root, output_summary_csv=None, output_rank_csv=None):
-    participants = find_local_participants(local_root)
-    if not participants:
-        log("⚠️ Keine Teilnehmerordner gefunden.")
-        return
-
-    summary = []
-    submission_stats = []
-
-    for ppath in participants:
-        submissions_dir = os.path.join(ppath, "Submissions")
-        if not os.path.isdir(submissions_dir):
+# ==================== EVALUATION ====================
+def evaluate_all_submissions(solutions: Dict[str, np.ndarray]) -> List[Dict]:
+    """Evaluate all participant submissions."""
+    results = []
+    
+    for participant_dir in Config.LOCAL_ROOT.rglob("PARTICIPANT_*"):
+        if not participant_dir.is_dir():
             continue
-
-        file_names = [f for f in os.listdir(submissions_dir)
-                      if os.path.isfile(os.path.join(submissions_dir, f))]
         
-        for fname in file_names:
-            participant_id, submission_num = parse_submission_filename(fname)
-            if participant_id is None:
+        submissions_dir = participant_dir / "Submissions"
+        if not submissions_dir.exists():
+            continue
+        
+        for submission_file in submissions_dir.glob("Results_*.csv"):
+            match = Config.SUBMISSION_PATTERN.match(submission_file.name)
+            if not match:
                 continue
             
-            sol_name = match_solution_file(fname, solutions)
-            if sol_name is None or sol_name not in solutions:
+            participant_id, submission_num = match.groups()
+            solution_name = next(iter(solutions.keys()), None)  # Use first solution
+            
+            if solution_name not in solutions:
                 continue
             
-            sol_arr = solutions[sol_name]
-            part_arr = load_numeric_file(os.path.join(submissions_dir, fname))
-            
-            if part_arr is None:
+            submission_data = load_csv_data(submission_file)
+            if submission_data is None:
                 continue
             
-            rmse = compute_rmse(sol_arr, part_arr)
+            rmse = compute_rmse(submission_data, solutions[solution_name])
             if rmse is None:
                 continue
             
-            submission_id = f"PARTICIPANT_{participant_id}_Sub{submission_num}"
-            
-            summary.append({
-                "participant": os.path.basename(ppath),
+            results.append({
+                "rank": 0,  # Will be assigned after sorting
+                "submission_id": f"PARTICIPANT_{participant_id}_Sub{submission_num}",
                 "participant_id": participant_id,
-                "submission_num": submission_num,
-                "submission_id": submission_id,
-                "participant_path": ppath,
-                "file": fname,
-                "solution_file": sol_name,
-                "rmse": rmse
-            })
-            
-            submission_stats.append({
-                "submission_id": submission_id,
-                "participant": os.path.basename(ppath),
-                "participant_id": participant_id,
-                "submission_num": submission_num,
+                "submission_num": int(submission_num),
                 "rmse": rmse,
-                "file": fname,
-                "participant_path": ppath
+                "filename": submission_file.name,
+                "path": str(participant_dir)
             })
+    
+    # Sort by RMSE and assign ranks
+    results.sort(key=lambda x: x["rmse"])
+    for i, result in enumerate(results, start=1):
+        result["rank"] = i
+    
+    log(f"Evaluated {len(results)} submission(s)", "DATA")
+    return results
 
-    if not submission_stats:
-        log("⚠️ Keine gültigen Submissions gefunden.")
-        return {}, summary
-
-    ranked = sorted(submission_stats, key=lambda x: x["rmse"])
-    log(f"🏆 Rangliste erstellt: {len(ranked)} Submissions")
-
-    # CSV: Detail-Summary
-    if output_summary_csv:
-        try:
-            with open(output_summary_csv, "w", newline="", encoding="utf-8") as f:
-                writer = csv.DictWriter(f, fieldnames=[
-                    "participant", "participant_id", "submission_num", "submission_id",
-                    "participant_path", "file", "solution_file", "rmse"
+def save_ranking_csv(results: List[Dict], output_path: Path):
+    """Save ranking results to CSV."""
+    try:
+        with open(output_path, "w", newline="", encoding="utf-8") as f:
+            writer = csv.writer(f, quoting=csv.QUOTE_MINIMAL)
+            writer.writerow(["Rank", "Submission_ID", "Participant_ID", "Submission_Num", "RMSE", "Filename", "Pfad"])
+            for result in results:
+                writer.writerow([
+                    result["rank"],
+                    result["submission_id"],
+                    result["participant_id"],
+                    result["submission_num"],
+                    f"{result['rmse']:.6f}",
+                    result["filename"],
+                    result["path"]
                 ])
-                writer.writeheader()
-                for row in summary:
-                    writer.writerow(row)
-            log(f"📄 Detail-Summary gespeichert")
-        except Exception as e:
-            log(f"❌ Fehler beim Schreiben der Detail-CSV: {e}")
+        log(f"Ranking saved to {output_path.name}", "SUCCESS")
+    except Exception as e:
+        log(f"Failed to save ranking: {e}", "ERROR")
 
-    # CSV: Ranking
-    if output_rank_csv:
-        try:
-            with open(output_rank_csv, "w", newline="", encoding="utf-8") as f:
-                writer = csv.writer(f, quoting=csv.QUOTE_MINIMAL)
-                writer.writerow(["Rank", "Submission_ID", "Participant_ID", "Submission_Num", 
-                               "RMSE", "Filename", "Pfad"])
-                for i, sub in enumerate(ranked, start=1):
-                    writer.writerow([
-                        i,
-                        sub["submission_id"],
-                        sub["participant_id"],
-                        sub["submission_num"],
-                        f"{sub['rmse']:.6f}",
-                        sub["file"],
-                        sub["participant_path"]
-                    ])
-            log(f"🏁 Rangliste gespeichert")
-        except Exception as e:
-            log(f"❌ Fehler beim Schreiben der Ranglisten-CSV: {e}")
-
-    return submission_stats, summary
-
-# ---- Git Push zum GitHub ----
-def git_push_updates():
-    if not ENABLE_GIT_PUSH:
-        log("ℹ️ Git-Push ist deaktiviert")
+# ==================== GIT OPERATIONS ====================
+def push_to_github():
+    """Push updated CSV to GitHub."""
+    if not Config.ENABLE_GIT_PUSH:
+        log("Git push disabled", "INFO")
         return False
     
-    if not os.path.exists(GITHUB_REPO_PATH):
-        log(f"❌ GitHub Repo-Pfad existiert nicht: {GITHUB_REPO_PATH}")
+    if not Config.GITHUB_REPO.exists():
+        log(f"GitHub repo path missing: {Config.GITHUB_REPO}", "ERROR")
         return False
     
     try:
-        log("📤 Kopiere CSV zu GitHub Repo...")
-        
-        import shutil
-        csv_source = os.path.join(LOCAL_ROOT, "rmse_ranking.csv")
-        csv_dest = os.path.join(GITHUB_REPO_PATH, "rmse_ranking.csv")
+        # Copy CSV to repo
+        csv_source = Config.LOCAL_ROOT / "rmse_ranking.csv"
+        csv_dest = Config.GITHUB_REPO / "rmse_ranking.csv"
         shutil.copy2(csv_source, csv_dest)
+        log("CSV copied to GitHub repo", "PROCESS")
         
-        os.chdir(GITHUB_REPO_PATH)
+        # Git operations
+        os.chdir(Config.GITHUB_REPO)
+        run_command([str(Config.GIT), "add", "rmse_ranking.csv"], check=True)
         
-        subprocess.run([GIT, "add", "rmse_ranking.csv"], check=True)
-
         commit_msg = f"Update rankings - {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}"
-        result = subprocess.run([GIT, "commit", "-m", commit_msg], capture_output=True, text=True)
-
-        # Check if there were changes
-        if "nothing to commit" in result.stdout:
-            log("ℹ️ Keine Änderungen zu committen")
+        rc, out, _ = run_command([str(Config.GIT), "commit", "-m", commit_msg])
+        
+        if "nothing to commit" in out:
+            log("No changes to commit", "INFO")
             return True
         
-        # Push
-        subprocess.run([GIT, "push"], check=True)
-        log("✅ Erfolgreich zu GitHub gepusht!")
+        run_command([str(Config.GIT), "push"], check=True)
+        log("Pushed to GitHub successfully", "SUCCESS")
         return True
         
     except subprocess.CalledProcessError as e:
-        log(f"❌ Git-Fehler: {e}")
+        log(f"Git error: {e}", "ERROR")
         return False
     except Exception as e:
-        log(f"❌ Fehler beim Git-Push: {e}")
+        log(f"Push failed: {e}", "ERROR")
         return False
 
-# ---- Hauptprogramm ----
-def run_update_cycle():
-    log("=" * 60)
-    log("🚀 Starte Update-Zyklus")
-    log("=" * 60)
+# ==================== MAIN WORKFLOW ====================
+def run_update_cycle() -> bool:
+    """Execute complete update cycle."""
+    log("="*60)
+    log("Starting update cycle", "PROCESS")
+    log("="*60)
     
-    if not os.path.exists(LOCAL_ROOT):
-        log(f"❌ LOCAL_ROOT existiert nicht: {LOCAL_ROOT}")
+    # 1. Fetch remote directories
+    all_dirs = get_remote_directories()
+    if not all_dirs:
+        log("No directories found on remote", "WARNING")
         return False
-
-    # 1. Remote-Daten herunterladen
-    log("🔍 Suche nach PARTICIPANT-Ordnern auf Remote...")
-    dirs = get_all_remote_dirs()
-    if not dirs:
-        log("⚠️ Keine Verzeichnisse gefunden")
-        return False
-
-    participant_bases = find_participant_bases(dirs)
-    log(f"📁 Gefundene Participant-Ordner: {len(participant_bases)}")
-
-    dirs_set = set(dirs)
-    for base in participant_bases:
-        if f"{base}/Submissions" in dirs_set:
-            copy_submissions(base)
-
-    log("✅ Download abgeschlossen")
-
-    # 2. Lösungen laden
-    solutions = load_solutions(SOLUTION_DIR)
+    
+    # 2. Find and sync participant submissions
+    participants = find_participant_directories(all_dirs)
+    log(f"Found {len(participants)} participant(s)")
+    
+    dirs_set = set(all_dirs)
+    for participant in participants:
+        if f"{participant}/Submissions" in dirs_set:
+            sync_submissions(participant)
+    
+    # 3. Load solutions
+    solutions = load_solutions()
     if not solutions:
-        log("❌ Keine Lösungen gefunden")
+        log("No solution files found", "ERROR")
         return False
-
-    # 3. Evaluation durchführen
-    log("📊 Starte Evaluation...")
-    out_summary = os.path.join(LOCAL_ROOT, "rmse_summary.csv")
-    out_rank = os.path.join(LOCAL_ROOT, "rmse_ranking.csv")
-    evaluate_participants(solutions, LOCAL_ROOT,
-                          output_summary_csv=out_summary,
-                          output_rank_csv=out_rank)
-
-    # 4. Zu GitHub pushen
-    if ENABLE_GIT_PUSH:
-        log("🔄 Push zu GitHub...")
-        git_push_updates()
-
-    log("✅ Update-Zyklus abgeschlossen")
-    log("=" * 60)
+    
+    # 4. Evaluate submissions
+    results = evaluate_all_submissions(solutions)
+    if not results:
+        log("No valid submissions found", "WARNING")
+        return False
+    
+    # 5. Save ranking
+    output_path = Config.LOCAL_ROOT / "rmse_ranking.csv"
+    save_ranking_csv(results, output_path)
+    
+    # 6. Push to GitHub
+    push_to_github()
+    
+    log("Update cycle completed", "SUCCESS")
+    log("="*60)
     return True
 
-# ---- Hauptschleife für stündliche Updates ----
 def main():
-    log("🤖 Automatisches Leaderboard-Update gestartet")
-    log(f"⏰ Update-Intervall: jede Stunde")
-    log(f"📁 Local Root: {LOCAL_ROOT}")
-    log(f"🌐 GitHub Repo: {GITHUB_REPO_PATH}")
-    log(f"🔄 Git-Push: {'aktiviert' if ENABLE_GIT_PUSH else 'deaktiviert'}")
+    """Main loop for continuous updates."""
+    log("🤖 Automatic Leaderboard Update Started")
+    log(f"⏰ Update Interval: Every {Config.UPDATE_INTERVAL_HOURS} hour(s)")
+    log(f"📁 Local Root: {Config.LOCAL_ROOT}")
+    log(f"🌐 GitHub Repo: {Config.GITHUB_REPO}")
+    log(f"🔄 Git Push: {'Enabled' if Config.ENABLE_GIT_PUSH else 'Disabled'}")
     
     while True:
         try:
             run_update_cycle()
             
-            # Warte 1 Stunde (3600 Sekunden)
-            log("😴 Warte 1 Stunde bis zum nächsten Update...")
-            time.sleep(3600)
+            sleep_seconds = Config.UPDATE_INTERVAL_HOURS * 3600
+            log(f"Sleeping for {Config.UPDATE_INTERVAL_HOURS} hour(s)...")
+            time.sleep(sleep_seconds)
             
         except KeyboardInterrupt:
-            log("⏹️ Programm beendet durch Benutzer")
+            log("Program stopped by user", "WARNING")
             break
         except Exception as e:
-            log(f"❌ Unerwarteter Fehler: {e}")
-            log("⏳ Warte 5 Minuten vor erneutem Versuch...")
+            log(f"Unexpected error: {e}", "ERROR")
+            log("Retrying in 5 minutes...")
             time.sleep(300)
 
 if __name__ == "__main__":
-
     main()
